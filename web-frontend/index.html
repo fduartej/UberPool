@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>POC Uber Pool</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link
+      rel="stylesheet"
+      href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+    />
+    <style>
+      #map {
+        height: 80vh;
+      }
+      .panel {
+        padding: 8px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="panel">
+      <button id="btnDriver">Driver: Online</button>
+      <button id="btnReq">Rider: Solicitar Viaje</button>
+      <button
+        id="btnReset"
+        style="background-color: #dc3545; color: white; margin-left: 10px"
+      >
+        🔄 Reiniciar
+      </button>
+    </div>
+    <div id="map"></div>
+
+    <!-- Leaflet -->
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+    <script type="module">
+      // Import the functions you need from the SDKs you need
+      import { initializeApp } from "https://www.gstatic.com/firebasejs/12.3.0/firebase-app.js";
+      import {
+        getDatabase,
+        ref,
+        set,
+        onValue,
+        push,
+        remove,
+      } from "https://www.gstatic.com/firebasejs/12.3.0/firebase-database.js";
+
+      // Your web app's Firebase configuration
+      const firebaseConfig = {};
+
+      // Initialize Firebase
+      const app = initializeApp(firebaseConfig);
+      const db = getDatabase(app);
+
+      // Mapa
+      const map = L.map("map").setView([-12.06, -77.05], 12);
+      L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+        maxZoom: 20,
+        attribution: "&copy; OSM",
+      }).addTo(map);
+
+      let driverMarker = null,
+        stopsLayer = L.layerGroup().addTo(map),
+        routeLine = null;
+
+      function drawPolyline(polyline6) {
+        if (!polyline6) return;
+
+        // Decodificador de polyline de Google (algoritmo estándar)
+        function decode(str, precision = 5) {
+          let index = 0,
+            lat = 0,
+            lng = 0;
+          const coordinates = [];
+          const factor = Math.pow(10, precision);
+
+          while (index < str.length) {
+            // Decodificar latitud
+            let byte = 0,
+              shift = 0,
+              result = 0;
+            do {
+              byte = str.charCodeAt(index++) - 63;
+              result |= (byte & 0x1f) << shift;
+              shift += 5;
+            } while (byte >= 0x20);
+
+            const deltaLat = result & 1 ? ~(result >> 1) : result >> 1;
+            lat += deltaLat;
+
+            // Decodificar longitud
+            shift = 0;
+            result = 0;
+            do {
+              byte = str.charCodeAt(index++) - 63;
+              result |= (byte & 0x1f) << shift;
+              shift += 5;
+            } while (byte >= 0x20);
+
+            const deltaLng = result & 1 ? ~(result >> 1) : result >> 1;
+            lng += deltaLng;
+
+            coordinates.push([lat / factor, lng / factor]);
+          }
+
+          return coordinates;
+        }
+
+        const latlngs = decode(polyline6, 6); // OSRM usa precisión 6
+        if (routeLine) map.removeLayer(routeLine);
+        if (latlngs.length) {
+          routeLine = L.polyline(latlngs, {
+            color: "blue",
+            weight: 4,
+            opacity: 0.8,
+          }).addTo(map);
+          map.fitBounds(routeLine.getBounds(), { padding: [20, 20] });
+        }
+      }
+
+      // Suscribirse a 1er trip que exista (POC)
+      onValue(ref(db, "trips"), (snap) => {
+        stopsLayer.clearLayers();
+        const trips = snap.val();
+        if (!trips) return;
+        const [, trip] = Object.entries(trips)[0];
+
+        // dibuja stops con colores diferenciados
+        Object.values(trip.stops || {}).forEach((s) => {
+          // Definir colores según el tipo de parada
+          let markerColor, iconSymbol;
+
+          if (s.type === "pickup") {
+            markerColor = "#28a745"; // Verde para pickup (recogida)
+            iconSymbol = "🚶‍♂️";
+          } else if (s.type === "dropoff" || s.type === "drop") {
+            markerColor = "#dc3545"; // Rojo para dropoff (entrega)
+            iconSymbol = "🏁";
+          } else {
+            markerColor = "#007bff"; // Azul por defecto
+            iconSymbol = "📍";
+          }
+
+          // Crear icono personalizado
+          const customIcon = L.divIcon({
+            className: "custom-marker",
+            html: `
+              <div style="
+                background-color: ${markerColor};
+                width: 25px;
+                height: 25px;
+                border-radius: 50%;
+                border: 3px solid white;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.3);
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-size: 12px;
+              ">${iconSymbol}</div>
+            `,
+            iconSize: [25, 25],
+            iconAnchor: [12.5, 12.5],
+          });
+
+          const marker = L.marker([s.lat, s.lng], { icon: customIcon }).addTo(
+            stopsLayer
+          );
+
+          // Extraer el nombre del pasajero (puede estar en passengerName o extraído del riderId)
+          let passengerDisplayName = s.passengerName || "Pasajero";
+          if (!s.passengerName && s.riderId) {
+            // Si no hay passengerName, intentar extraer del riderId
+            const nameMatch = s.riderId.match(/^(.+)_\d+$/);
+            passengerDisplayName = nameMatch ? nameMatch[1] : s.riderId;
+          }
+
+          marker.bindPopup(`
+            <b>${
+              s.type === "pickup" ? "🚶‍♂️ Recogida de" : "🏁 Entrega de"
+            }</b><br>
+            <strong style="color: #333; font-size: 14px;">${passengerDisplayName}</strong><br>
+            <small style="color: #666;">ID: ${s.riderId || "N/A"}</small>
+          `);
+        });
+
+        // polyline
+        drawPolyline(trip.polyline);
+      });
+
+      // Ubicación del driver (POC: 1 driver)
+      onValue(ref(db, "drivers/driver_demo/loc"), (snap) => {
+        const loc = snap.val();
+        if (!loc) return;
+        if (!driverMarker) {
+          // Crear icono personalizado para el conductor
+          const driverIcon = L.divIcon({
+            className: "driver-marker",
+            html: `
+              <div style="
+                background-color: #ffc107;
+                width: 35px;
+                height: 35px;
+                border-radius: 50%;
+                border: 4px solid white;
+                box-shadow: 0 3px 6px rgba(0,0,0,0.4);
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-size: 16px;
+                animation: pulse 2s infinite;
+              ">🚗</div>
+              <style>
+                @keyframes pulse {
+                  0% { transform: scale(1); }
+                  50% { transform: scale(1.1); }
+                  100% { transform: scale(1); }
+                }
+              </style>
+            `,
+            iconSize: [35, 35],
+            iconAnchor: [17.5, 17.5],
+          });
+
+          driverMarker = L.marker([loc.lat, loc.lng], {
+            icon: driverIcon,
+            title: "Conductor Online",
+          }).addTo(map);
+
+          driverMarker.bindPopup(`
+            <b>🚗 Conductor</b><br>
+            Estado: Online<br>
+            ID: driver_demo
+          `);
+        } else {
+          driverMarker.setLatLng([loc.lat, loc.lng]);
+        }
+      });
+
+      // Botones
+      document.getElementById("btnDriver").onclick = async () => {
+        await fetch("http://localhost:3000/driver/online", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            driverId: "driver_demo",
+            loc: { lat: -12.06, lng: -77.05 },
+          }),
+        });
+      };
+
+      document.getElementById("btnReq").onclick = async () => {
+        // Pedir nombre del pasajero
+        const passengerName = prompt("🙋‍♂️ Ingresa tu nombre:", "");
+
+        if (!passengerName || passengerName.trim() === "") {
+          alert("❌ Necesitas ingresar tu nombre para solicitar un viaje");
+          return;
+        }
+
+        // POC: genera origen/dest aleatorios cercanos
+        const base = [-12.06, -77.05];
+        const origin = {
+          lat: base[0] + (Math.random() - 0.5) * 0.05,
+          lng: base[1] + (Math.random() - 0.5) * 0.05,
+        };
+        const dest = {
+          lat: base[0] + (Math.random() - 0.5) * 0.05,
+          lng: base[1] + (Math.random() - 0.5) * 0.05,
+        };
+
+        const riderId = `${passengerName.trim()}_${Date.now()}`;
+
+        await fetch("http://localhost:3000/request", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            riderId: riderId,
+            passengerName: passengerName.trim(),
+            origin,
+            dest,
+          }),
+        });
+
+        alert(
+          `🚕 Viaje solicitado para ${passengerName}! Buscando conductor...`
+        );
+      };
+
+      document.getElementById("btnReset").onclick = async () => {
+        if (
+          confirm(
+            "⚠️ ¿Estás seguro de que quieres reiniciar todo? Esto eliminará todos los conductores, viajes y solicitudes."
+          )
+        ) {
+          try {
+            // Limpiar Firebase Database
+            await Promise.all([
+              remove(ref(db, "drivers")),
+              remove(ref(db, "trips")),
+              remove(ref(db, "rideRequests")),
+            ]);
+
+            // Limpiar el mapa
+            stopsLayer.clearLayers();
+            if (routeLine) {
+              map.removeLayer(routeLine);
+              routeLine = null;
+            }
+            if (driverMarker) {
+              map.removeLayer(driverMarker);
+              driverMarker = null;
+            }
+
+            // Llamar al endpoint de reset del backend (si existe)
+            try {
+              await fetch("http://localhost:3000/reset", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+              });
+            } catch (e) {
+              console.log("Backend reset endpoint not available");
+            }
+
+            alert("✅ Sistema reiniciado correctamente");
+          } catch (error) {
+            console.error("Error al reiniciar:", error);
+            alert("❌ Error al reiniciar el sistema");
+          }
+        }
+      };
+    </script>
+  </body>
+</html>

@@ -1,0 +1,8 @@
+services:
+  osrm-routed:
+    image: osrm/osrm-backend:latest
+    command: osrm-routed --algorithm mld /data/peru-250928.osrm
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./osrm:/data
